@@ -1,38 +1,111 @@
-import streamlit as st
-import requests
-import pandas as pd
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from bs4 import BeautifulSoup
+import httpx
+import re
+import time
 
-st.set_page_config(page_title="Backlink Analyzer", layout="wide")
-st.title("Backlink Analyzer")
+app = FastAPI(title="Backlink Analyzer API", version="1.1")
 
-def parse_backlinks(html):
+# =======================
+# CORS (WordPress Safe)
+# =======================
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # WP plugin use karega to issue nahi hoga
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# =======================
+# Models
+# =======================
+class DomainRequest(BaseModel):
+    domain: str
+
+# =======================
+# Simple Rate Limiter
+# =======================
+RATE_LIMIT = {}
+LIMIT = 5          # 5 requests
+WINDOW = 60        # per 60 seconds
+
+def is_allowed(ip: str) -> bool:
+    now = time.time()
+    hits = RATE_LIMIT.get(ip, [])
+    hits = [t for t in hits if now - t < WINDOW]
+
+    if len(hits) >= LIMIT:
+        return False
+
+    hits.append(now)
+    RATE_LIMIT[ip] = hits
+    return True
+
+# =======================
+# Domain Validation
+# =======================
+DOMAIN_REGEX = r"^(?!-)[A-Za-z0-9-]{1,63}(?<!-)\.[A-Za-z]{2,}$"
+
+def validate_domain(domain: str):
+    if not re.match(DOMAIN_REGEX, domain):
+        raise HTTPException(status_code=400, detail="Invalid domain format")
+
+# =======================
+# HTML Parser
+# =======================
+def parse_backlinks(html: str):
     soup = BeautifulSoup(html, "html.parser")
 
     stats = {}
     for block in soup.select(".statistic"):
-        value = block.find("h3").get_text(strip=True).replace(",", "")
-        label = block.find("span").get_text(strip=True)
-        stats[label] = int(value)
+        try:
+            value = block.find("h3").get_text(strip=True).replace(",", "")
+            label = block.find("span").get_text(strip=True)
+            stats[label] = int(value)
+        except Exception:
+            continue
 
-    rows = []
+    backlinks = []
     for tr in soup.select("#backlinks tbody tr"):
-        tds = tr.find_all("td")
-        rows.append({
-            "Page Title": tds[1].select_one("strong[data-key='title']").get_text(strip=True),
-            "Source URL": tds[1].select_one("a[data-key='url']")["href"],
-            "Anchor Text": tds[2].select_one("strong[data-key='title']").get_text(strip=True),
-            "Target URL": tds[2].select_one("a[data-key='url']")["href"],
-            "PA": int(tds[3].select_one(".value").text),
-            "DA": int(tds[4].select_one(".value").text),
-            "Found Date": tds[5].get_text(strip=True)
-        })
+        try:
+            tds = tr.find_all("td")
+            backlinks.append({
+                "page_title": tds[1].select_one("strong[data-key='title']").get_text(strip=True),
+                "source_url": tds[1].select_one("a[data-key='url']")["href"],
+                "anchor_text": tds[2].select_one("strong[data-key='title']").get_text(strip=True),
+                "target_url": tds[2].select_one("a[data-key='url']")["href"],
+                "pa": int(tds[3].select_one(".value").text),
+                "da": int(tds[4].select_one(".value").text),
+                "found_date": tds[5].get_text(strip=True)
+            })
+        except Exception:
+            continue
 
-    return stats, rows
+    return stats, backlinks
 
-domain = st.text_input("Enter Domain", "thewebhospitality.com")
+# =======================
+# Routes
+# =======================
+@app.get("/")
+def home():
+    return {
+        "message": "Backlink Analyzer API",
+        "status": "running"
+    }
 
-if st.button("Analyze"):
+@app.post("/analyze")
+async def analyze(request: Request, payload: DomainRequest):
+    client_ip = request.client.host
+
+    if not is_allowed(client_ip):
+        raise HTTPException(status_code=429, detail="Rate limit exceeded")
+
+    domain = payload.domain.strip().lower()
+    validate_domain(domain)
+
     url = "https://rankifyer.com/free-seo-tools/embed"
 
     params = {
@@ -46,33 +119,32 @@ if st.button("Analyze"):
     }
 
     headers = {
-        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/143.0.0.0",
+        "user-agent": "Mozilla/5.0",
         "accept": "text/html"
     }
 
-    with st.spinner("Fetching data..."):
-        r = requests.get(url, params=params, headers=headers, timeout=30)
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            response = await client.get(url, params=params, headers=headers)
 
-    if r.status_code == 200:
-        stats, backlinks = parse_backlinks(r.text)
+        if response.status_code != 200:
+            raise HTTPException(status_code=502, detail="Source service error")
 
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Total Backlinks", stats.get("backlinks", 0))
-        c2.metric("Unique Backlinks", stats.get("unique backlinks", 0))
-        c3.metric("Links to Homepage", stats.get("links to homepage", 0))
-        c4.metric("Nofollow Backlinks", stats.get("nofollow backlinks", 0))
+        stats, backlinks = parse_backlinks(response.text)
 
-        df = pd.DataFrame(backlinks)
+        return {
+            "success": True,
+            "domain": domain,
+            "stats": stats,
+            "total_backlinks": len(backlinks),
+            "backlinks": backlinks
+        }
 
-        st.subheader("Top Backlinks")
-        st.dataframe(df, use_container_width=True)
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="Request timeout")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-        st.download_button(
-            "Download CSV",
-            df.to_csv(index=False),
-            "backlinks.csv",
-            "text/csv"
-        )
-    else:
-        st.error("Request failed")
-
+@app.get("/health")
+def health():
+    return {"status": "ok"}
