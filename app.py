@@ -30,7 +30,7 @@ def parse_backlinks(html):
 
     return stats, rows
 
-domain = st.text_input("Enter Domain", "techbullion.com")
+domain = st.text_input("Enter Domain", "thewebhospitality.com")
 
 if st.button("Analyze"):
     url = "https://rankifyer.com/free-seo-tools/embed"
@@ -75,3 +75,4 @@ if st.button("Analyze"):
         )
     else:
         st.error("Request failed")
+
